@@ -19,6 +19,19 @@
 (define-constant ERR-BELOW-MINIMUM (err u1006))
 (define-constant ERR-PAUSED (err u1007))
 
+;; Event types
+(define-constant EVENT-CONTRACT-INITIALIZED "contract-initialized")
+(define-constant EVENT-STAKE-CREATED "stake-created")
+(define-constant EVENT-UNSTAKE-INITIATED "unstake-initiated")
+(define-constant EVENT-UNSTAKE-COMPLETED "unstake-completed")
+(define-constant EVENT-PROPOSAL-CREATED "proposal-created")
+(define-constant EVENT-VOTE-CAST "vote-cast")
+(define-constant EVENT-PROPOSAL-EXECUTED "proposal-executed")
+(define-constant EVENT-REWARDS-CLAIMED "rewards-claimed")
+(define-constant EVENT-TIER-UPGRADED "tier-upgraded")
+(define-constant EVENT-CONTRACT-PAUSED "contract-paused")
+(define-constant EVENT-CONTRACT-RESUMED "contract-resumed")
+
 ;; Protocol State Variables
 (define-data-var contract-paused bool false)
 (define-data-var emergency-mode bool false)
@@ -106,6 +119,19 @@
                 reward-multiplier: u200,  ;; 2x
                 features-enabled: (list true true true true true false false false false false)
             })
+        
+        (print {
+            event: EVENT-CONTRACT-INITIALIZED,
+            initialized-by: tx-sender,
+            timestamp: stacks-block-height,
+            tier1-min: u1000000,
+            tier1-mult: u100,
+            tier2-min: u5000000,
+            tier2-mult: u150,
+            tier3-min: u10000000,
+            tier3-mult: u200
+        })
+        
         (ok true)
     )
 )
@@ -141,6 +167,8 @@
                 (new-total-stake (+ (get stx-staked current-position) amount))
                 (tier-info (get-tier-info new-total-stake))
                 (lock-multiplier (calculate-lock-multiplier lock-period))
+                (old-tier (get tier-level current-position))
+                (new-tier (get tier-level tier-info))
             )
             
             ;; Update staking position
@@ -162,7 +190,7 @@
                 (merge current-position
                     {
                         stx-staked: new-total-stake,
-                        tier-level: (get tier-level tier-info),
+                        tier-level: new-tier,
                         rewards-multiplier: (* (get reward-multiplier tier-info) lock-multiplier)
                     }
                 )
@@ -170,7 +198,34 @@
             
             ;; Update STX pool
             (var-set stx-pool (+ (var-get stx-pool) amount))
-            (ok true)
+            
+            ;; Emit stake event
+            (print {
+                event: EVENT-STAKE-CREATED,
+                user: tx-sender,
+                amount: amount,
+                lock-period: lock-period,
+                tier-level: new-tier,
+                multiplier: (* (get reward-multiplier tier-info) lock-multiplier),
+                start-block: stacks-block-height,
+                total-staked: new-total-stake
+            })
+            
+            ;; Emit tier upgrade if applicable
+            (if (> new-tier old-tier)
+                (begin
+                    (print {
+                        event: EVENT-TIER-UPGRADED,
+                        user: tx-sender,
+                        old-tier: old-tier,
+                        new-tier: new-tier,
+                        total-staked: new-total-stake,
+                        new-multiplier: (get reward-multiplier tier-info)
+                    })
+                    (ok true)
+                )
+                (ok true)
+            )
         )
     )
 )
@@ -194,6 +249,15 @@
                 }
             )
         )
+        
+        (print {
+            event: EVENT-UNSTAKE-INITIATED,
+            user: tx-sender,
+            amount: amount,
+            cooldown-start: stacks-block-height,
+            cooldown-ends: (+ stacks-block-height (var-get cooldown-period))
+        })
+        
         (ok true)
     )
 )
@@ -213,8 +277,50 @@
         ;; Clear staking position
         (map-delete StakingPositions tx-sender)
         
+        (print {
+            event: EVENT-UNSTAKE-COMPLETED,
+            user: tx-sender,
+            amount: (get amount staking-position),
+            cooldown-period: (var-get cooldown-period),
+            completed-at: stacks-block-height
+        })
+        
         (ok true)
     )
+)
+
+;; Claim rewards
+;; Claim rewards
+(define-public (claim-rewards)
+  (let (
+    (staking-position (unwrap! (map-get? StakingPositions tx-sender) ERR-NO-STAKE))
+    (blocks-elapsed (- stacks-block-height (get last-claim staking-position)))
+    (rewards (calculate-rewards tx-sender blocks-elapsed))
+  )
+    (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
+    
+    ;; Mint rewards tokens - must check this result
+    (try! (ft-mint? ANALYTICS-TOKEN rewards tx-sender))
+    
+    ;; Update last claim
+    (map-set StakingPositions
+      tx-sender
+      (merge staking-position {
+        last-claim: stacks-block-height,
+        accumulated-rewards: (+ (get accumulated-rewards staking-position) rewards)
+      })
+    )
+    
+    (print {
+      event: EVENT-REWARDS-CLAIMED,
+      user: tx-sender,
+      rewards: rewards,
+      blocks-elapsed: blocks-elapsed,
+      timestamp: stacks-block-height
+    })
+    
+    (ok rewards)
+  )
 )
 
 ;; Create governance proposal
@@ -242,6 +348,17 @@
         )
         
         (var-set proposal-count proposal-id)
+        
+        (print {
+            event: EVENT-PROPOSAL-CREATED,
+            proposal-id: proposal-id,
+            creator: tx-sender,
+            description: description,
+            start-block: stacks-block-height,
+            end-block: (+ stacks-block-height voting-period),
+            creator-voting-power: (get voting-power user-position)
+        })
+        
         (ok proposal-id)
     )
 )
@@ -266,6 +383,18 @@
                 }
             )
         )
+        
+        (print {
+            event: EVENT-VOTE-CAST,
+            proposal-id: proposal-id,
+            voter: tx-sender,
+            vote-for: vote-for,
+            voting-power: voting-power,
+            total-votes-for: (if vote-for (+ (get votes-for proposal) voting-power) (get votes-for proposal)),
+            total-votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-power)),
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
@@ -275,6 +404,14 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (var-set contract-paused true)
+        
+        (print {
+            event: EVENT-CONTRACT-PAUSED,
+            paused-by: tx-sender,
+            timestamp: stacks-block-height,
+            emergency-mode: (var-get emergency-mode)
+        })
+        
         (ok true)
     )
 )
@@ -284,6 +421,13 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (var-set contract-paused false)
+        
+        (print {
+            event: EVENT-CONTRACT-RESUMED,
+            resumed-by: tx-sender,
+            timestamp: stacks-block-height
+        })
+        
         (ok true)
     )
 )
